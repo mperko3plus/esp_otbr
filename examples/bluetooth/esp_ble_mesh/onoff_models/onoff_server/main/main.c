@@ -10,9 +10,22 @@
 #include <stdio.h>
 #include <string.h>
 #include <inttypes.h>
+#include "cJSON.h"  
 
 #include "esp_log.h"
 #include "nvs_flash.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/event_groups.h"
+#include "esp_system.h"
+#include "esp_wifi.h"
+#include "esp_event.h"
+#include "driver/gpio.h"
+#include "lwip/err.h"
+#include "lwip/sys.h"
+#include "lwip/sockets.h"
+
+
 
 #include "esp_ble_mesh_defs.h"
 #include "esp_ble_mesh_common_api.h"
@@ -21,6 +34,14 @@
 #include "esp_ble_mesh_config_model_api.h"
 #include "esp_ble_mesh_generic_model_api.h"
 #include "esp_ble_mesh_local_data_operation_api.h"
+#include "esp_gap_ble_api.h"
+#include "esp_ble_mesh_ble_api.h"
+#include "scan.h"
+
+
+
+
+#define PUSH_BUTTON_PIN  22
 
 #include "board.h"
 #include "ble_mesh_example_init.h"
@@ -29,9 +50,22 @@
 
 #define CID_ESP 0x02E5
 
+#define ESP_BLE_MESH_VND_MODEL_ID_CLIENT    0x0000
+#define ESP_BLE_MESH_VND_MODEL_ID_SERVER    0x0001
+
+#define ESP_BLE_MESH_VND_MODEL_OP_SET      ESP_BLE_MESH_MODEL_OP_3(0x00, CID_ESP)
+#define ESP_BLE_MESH_VND_MODEL_OP_STATUS    ESP_BLE_MESH_MODEL_OP_3(0x01, CID_ESP)
+#define ESP_BLE_MESH_VND_MODEL_OP_GET      ESP_BLE_MESH_MODEL_OP_3(0x02, CID_ESP)
+
+
+
+
 extern struct _led_state led_state[3];
 
 static uint8_t dev_uuid[16] = { 0xdd, 0xdd };
+
+static uint8_t saved_data[16];  // Adjust the size as needed
+static uint16_t saved_data_len = 0;
 
 static esp_ble_mesh_cfg_srv_t config_server = {
     /* 3 transmissions with 20ms interval */
@@ -58,41 +92,30 @@ static esp_ble_mesh_gen_onoff_srv_t onoff_server_0 = {
         .get_auto_rsp = ESP_BLE_MESH_SERVER_AUTO_RSP,
         .set_auto_rsp = ESP_BLE_MESH_SERVER_AUTO_RSP,
     },
-};
-
-ESP_BLE_MESH_MODEL_PUB_DEFINE(onoff_pub_1, 2 + 3, ROLE_NODE);
-static esp_ble_mesh_gen_onoff_srv_t onoff_server_1 = {
-    .rsp_ctrl = {
-        .get_auto_rsp = ESP_BLE_MESH_SERVER_RSP_BY_APP,
-        .set_auto_rsp = ESP_BLE_MESH_SERVER_RSP_BY_APP,
+    .state = {
+        .onoff = 0,
     },
 };
 
-ESP_BLE_MESH_MODEL_PUB_DEFINE(onoff_pub_2, 2 + 3, ROLE_NODE);
-static esp_ble_mesh_gen_onoff_srv_t onoff_server_2 = {
-    .rsp_ctrl = {
-        .get_auto_rsp = ESP_BLE_MESH_SERVER_AUTO_RSP,
-        .set_auto_rsp = ESP_BLE_MESH_SERVER_RSP_BY_APP,
-    },
-};
 
 static esp_ble_mesh_model_t root_models[] = {
     ESP_BLE_MESH_MODEL_CFG_SRV(&config_server),
     ESP_BLE_MESH_MODEL_GEN_ONOFF_SRV(&onoff_pub_0, &onoff_server_0),
 };
 
-static esp_ble_mesh_model_t extend_model_0[] = {
-    ESP_BLE_MESH_MODEL_GEN_ONOFF_SRV(&onoff_pub_1, &onoff_server_1),
+static esp_ble_mesh_model_op_t vnd_op[] = {
+    ESP_BLE_MESH_MODEL_OP(ESP_BLE_MESH_VND_MODEL_OP_SET, 2),
+    ESP_BLE_MESH_MODEL_OP(ESP_BLE_MESH_VND_MODEL_OP_GET, 0),
+    ESP_BLE_MESH_MODEL_OP_END,
 };
 
-static esp_ble_mesh_model_t extend_model_1[] = {
-    ESP_BLE_MESH_MODEL_GEN_ONOFF_SRV(&onoff_pub_2, &onoff_server_2),
+static esp_ble_mesh_model_t vnd_models[] = {
+    ESP_BLE_MESH_VENDOR_MODEL(CID_ESP, ESP_BLE_MESH_VND_MODEL_ID_SERVER,
+    vnd_op, NULL, NULL),
 };
 
 static esp_ble_mesh_elem_t elements[] = {
-    ESP_BLE_MESH_ELEMENT(0, root_models, ESP_BLE_MESH_MODEL_NONE),
-    ESP_BLE_MESH_ELEMENT(0, extend_model_0, ESP_BLE_MESH_MODEL_NONE),
-    ESP_BLE_MESH_ELEMENT(0, extend_model_1, ESP_BLE_MESH_MODEL_NONE),
+    ESP_BLE_MESH_ELEMENT(0, root_models, vnd_models),
 };
 
 static esp_ble_mesh_comp_t composition = {
@@ -179,6 +202,7 @@ static void example_handle_gen_onoff_msg(esp_ble_mesh_model_t *model,
         break;
     }
 }
+
 
 static void example_ble_mesh_provisioning_cb(esp_ble_mesh_prov_cb_event_t event,
                                              esp_ble_mesh_prov_cb_param_t *param)
@@ -290,6 +314,60 @@ static void example_ble_mesh_config_server_cb(esp_ble_mesh_cfg_server_cb_event_t
     }
 }
 
+static void example_ble_mesh_custom_model_cb(esp_ble_mesh_model_cb_event_t event,
+                                             esp_ble_mesh_model_cb_param_t *param)
+{
+    switch (event) {
+    case ESP_BLE_MESH_MODEL_OPERATION_EVT:
+        if (param->model_operation.opcode == ESP_BLE_MESH_VND_MODEL_OP_SET) {
+            // Handle incoming set message
+            saved_data_len = param->model_operation.length;
+            if (saved_data_len > sizeof(saved_data)) {
+                ESP_LOGE(TAG, "Received data length exceeds buffer size");
+                return;
+            }
+            memcpy(saved_data, param->model_operation.msg, saved_data_len);
+            ESP_LOGI(TAG, "Received set message, length: %d", saved_data_len);
+            
+            // Save the received data or perform any necessary actions
+        } else if (param->model_operation.opcode == ESP_BLE_MESH_VND_MODEL_OP_GET) {
+            // Handle incoming get message
+            ESP_LOGI(TAG, "Received get message");
+            
+            // Prepare and send response if needed
+            if (saved_data_len > 0) {
+                esp_ble_mesh_msg_ctx_t ctx;
+                memcpy(&ctx, param->model_operation.ctx, sizeof(esp_ble_mesh_msg_ctx_t));
+                esp_ble_mesh_model_t *model = param->model_operation.model;
+
+                esp_err_t err = esp_ble_mesh_server_model_send_msg(
+                    model, &ctx, ESP_BLE_MESH_VND_MODEL_OP_STATUS, 
+                    saved_data_len, saved_data
+                );
+                if (err != ESP_OK) {
+                    ESP_LOGE(TAG, "Failed to send response message, err %d", err);
+                } else {
+                    ESP_LOGI(TAG, "Sent response message with length: %d", saved_data_len);
+                }
+            } else {
+                ESP_LOGI(TAG, "No data to send in response to get message");
+            }
+        }
+        break;
+    case ESP_BLE_MESH_MODEL_SEND_COMP_EVT:
+        if (param->model_send_comp.err_code) {
+            ESP_LOGE(TAG, "Failed to send message 0x%06" PRIx32, param->model_send_comp.opcode);
+        } else {
+            ESP_LOGI(TAG, "Send 0x%06" PRIx32, param->model_send_comp.opcode);
+        }
+        break;
+    default:
+        break;
+    }
+}
+
+
+
 static esp_err_t ble_mesh_init(void)
 {
     esp_err_t err = ESP_OK;
@@ -297,6 +375,7 @@ static esp_err_t ble_mesh_init(void)
     esp_ble_mesh_register_prov_callback(example_ble_mesh_provisioning_cb);
     esp_ble_mesh_register_config_server_callback(example_ble_mesh_config_server_cb);
     esp_ble_mesh_register_generic_server_callback(example_ble_mesh_generic_server_cb);
+    esp_ble_mesh_register_custom_model_callback(example_ble_mesh_custom_model_cb);
 
     err = esp_ble_mesh_init(&provision, &composition);
     if (err != ESP_OK) {
@@ -322,7 +401,7 @@ void app_main(void)
     esp_err_t err;
 
     ESP_LOGI(TAG, "Initializing...");
-
+    gpio_set_direction(PUSH_BUTTON_PIN, GPIO_MODE_INPUT);
     board_init();
 
     err = nvs_flash_init();
@@ -345,4 +424,6 @@ void app_main(void)
     if (err) {
         ESP_LOGE(TAG, "Bluetooth mesh init failed (err %d)", err);
     }
+
 }
+

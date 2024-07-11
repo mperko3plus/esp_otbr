@@ -603,6 +603,46 @@ static void spp_uart_init(void)
     xTaskCreate(uart_task, "uTask", 2048, (void*)UART_NUM_0, 8, NULL);
 }
 
+
+
+
+
+
+
+
+
+void send_led_on(void)
+{
+    if (!is_connect || db == NULL) {
+        ESP_LOGE("BLE", "Not connected or DB is NULL");
+        return;
+    }
+
+    uint8_t led_on_value = 0x01;  // Assuming '1' turns the LED on. Adjust this based on your requirement.
+
+    printf("sakhen");
+    esp_err_t err = esp_ble_gattc_write_char(
+        spp_gattc_if,
+        spp_conn_id,
+        47,
+        sizeof(led_on_value),
+        &led_on_value,
+        ESP_GATT_WRITE_TYPE_RSP,
+        ESP_GATT_AUTH_REQ_NONE
+    );
+
+    if (err != ESP_OK) {
+        ESP_LOGE("BLE", "Failed to write characteristic: %s", esp_err_to_name(err));
+    } else {
+        ESP_LOGI("BLE", "Successfully wrote LED ON command");
+    }
+}
+
+
+
+
+
+
 void app_main(void)
 {
     esp_err_t ret;
@@ -639,4 +679,6 @@ void app_main(void)
 
     ble_client_appRegister();
     spp_uart_init();
+    vTaskDelay(pdMS_TO_TICKS(5000));  // 5000 milliseconds = 5 seconds
+    send_led_on();
 }

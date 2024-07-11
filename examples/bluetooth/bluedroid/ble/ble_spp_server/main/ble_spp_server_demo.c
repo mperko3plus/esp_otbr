@@ -22,6 +22,7 @@
 #include "esp_bt_device.h"
 #include "ble_spp_server_demo.h"
 #include "esp_gatt_common_api.h"
+#include "board.h"
 
 #define GATTS_TABLE_TAG  "GATTS_SPP_DEMO"
 
@@ -115,6 +116,12 @@ static spp_receive_data_buff_t SppRecvDataBuff = {
     .buff_size  = 0,
     .first_node = NULL
 };
+
+
+
+extern struct _led_state led_state[3];
+
+
 
 static void gatts_profile_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if, esp_ble_gatts_cb_param_t *param);
 
@@ -666,6 +673,10 @@ void app_main(void)
     esp_err_t ret;
     esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
 
+    board_init();
+    board_led_operation(GPIO_NUM_3, LED_OFF);
+    board_led_operation(GPIO_NUM_3, LED_ON);
+
     // Initialize NVS
     ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -711,6 +722,10 @@ void app_main(void)
     if (local_mtu_ret){
         ESP_LOGE(GATTS_TABLE_TAG, "set local  MTU failed, error code = %x", local_mtu_ret);
     }
+
+
+    
+
 
     return;
 }

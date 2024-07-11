@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <inttypes.h>
+#include "cJSON.h"  
 
 #include "esp_log.h"
 #include "nvs_flash.h"
@@ -19,16 +20,42 @@
 #include "esp_ble_mesh_networking_api.h"
 #include "esp_ble_mesh_config_model_api.h"
 #include "esp_ble_mesh_generic_model_api.h"
-
+#include "esp_wifi.h"
 #include "board.h"
+#include "esp_wifi.h"
+#include "esp_system.h"
+#include "esp_event.h"
+#include "lwip/sys.h"
+#include "lwip/sockets.h"
 #include "ble_mesh_example_init.h"
 #include "ble_mesh_example_nvs.h"
 
 #define TAG "EXAMPLE"
 
 #define CID_ESP 0x02E5
+#define PUSH_BUTTON_PIN  22
+/* WiFi configuration */
+#define EXAMPLE_ESP_WIFI_SSID      "Galaxy A53 5G CA17"
+#define EXAMPLE_ESP_WIFI_PASS      "mperko12"
+#define EXAMPLE_ESP_MAXIMUM_RETRY  5
 
-static uint8_t dev_uuid[16] = { 0xdd, 0xdd };
+static EventGroupHandle_t s_wifi_event_group;
+
+/* Constants for event bits */
+#define WIFI_CONNECTED_BIT BIT0
+#define WIFI_FAIL_BIT      BIT1
+static int s_retry_num = 0;
+
+/* Constants for IP address and port */
+#define REMOTE_IP_ADDR      "192.168.50.231"
+#define REMOTE_PORT         5002
+// Constants for provisioning
+#define DEVICE_NAME "ESP32_MESH_NODE"
+#define ADV_MANUFACTURER_DATA_LEN 6
+#define NODE_ID_SIZE 16
+#define MESH_PROV_URI "provisioning-uri"
+
+static uint8_t dev_uuid[NODE_ID_SIZE];
 
 static struct example_info_store {
     uint16_t net_idx;   /* NetKey Index */
@@ -96,6 +123,23 @@ static esp_ble_mesh_prov_t provision = {
     .output_actions = 0,
 #endif
 };
+
+
+typedef enum {
+    EVENT_ON,
+    EVENT_OFF,
+    EVENT_UNKNOWN
+} EventType;
+
+EventType get_event_type(const char *event) {
+    if (strcmp(event, "on") == 0) {
+        return EVENT_ON;
+    } else if (strcmp(event, "off") == 0) {
+        return EVENT_OFF;
+    } else {
+        return EVENT_UNKNOWN;
+    }
+}
 
 static void mesh_example_info_store(void)
 {
@@ -292,6 +336,304 @@ static esp_err_t ble_mesh_init(void)
     return err;
 }
 
+static void event_handler(void* arg, esp_event_base_t event_base,
+                          int32_t event_id, void* event_data)
+{
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
+        esp_wifi_connect();
+    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        if (s_retry_num < EXAMPLE_ESP_MAXIMUM_RETRY) {
+            esp_wifi_connect();
+            s_retry_num++;
+            ESP_LOGI(TAG, "retry to connect to the AP");
+        } else {
+            xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
+        }
+        ESP_LOGI(TAG, "connect to the AP fail");
+    } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
+        ESP_LOGI(TAG, "got ip:" IPSTR, IP2STR(&event->ip_info.ip));
+        s_retry_num = 0;
+        xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
+    }
+}
+
+void wifi_init_sta(void)
+{
+    s_wifi_event_group = xEventGroupCreate();
+
+    ESP_ERROR_CHECK(esp_netif_init());
+
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    esp_netif_create_default_wifi_sta();
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+
+    esp_event_handler_instance_t instance_any_id;
+    esp_event_handler_instance_t instance_got_ip;
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT,
+                                                        ESP_EVENT_ANY_ID,
+                                                        &event_handler,
+                                                        NULL,
+                                                        &instance_any_id));
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT,
+                                                        IP_EVENT_STA_GOT_IP,
+                                                        &event_handler,
+                                                        NULL,
+                                                        &instance_got_ip));
+
+    wifi_config_t wifi_config = {
+        .sta = {
+            .ssid = EXAMPLE_ESP_WIFI_SSID,
+            .password = EXAMPLE_ESP_WIFI_PASS,
+            // .sae_pwe_h2e and .sae_h2e_identifier are optional depending on your configuration
+        },
+    };
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
+    ESP_ERROR_CHECK(esp_wifi_start());
+
+    ESP_LOGI(TAG, "wifi_init_sta finished.");
+
+    EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group,
+            WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
+            pdFALSE,
+            pdFALSE,
+            portMAX_DELAY);
+
+    if (bits & WIFI_CONNECTED_BIT) {
+        ESP_LOGI(TAG, "connected to ap SSID:%s password:%s",
+                 EXAMPLE_ESP_WIFI_SSID, EXAMPLE_ESP_WIFI_PASS);
+    } else if (bits & WIFI_FAIL_BIT) {
+        ESP_LOGI(TAG, "Failed to connect to SSID:%s, password:%s",
+                 EXAMPLE_ESP_WIFI_SSID, EXAMPLE_ESP_WIFI_PASS);
+    } else {
+        ESP_LOGE(TAG, "UNEXPECTED EVENT");
+    }
+}
+
+/* Function to connect to a remote server */
+/* Function to connect to a remote server */
+int connect_to_server(const char* ip, int port)
+{
+    struct sockaddr_in dest_addr;
+    int socket_fd;
+
+    socket_fd = socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
+    if (socket_fd == -1) {
+        ESP_LOGE(TAG, "Failed to create socket");
+        return -1;
+    }
+
+    memset(&dest_addr, 0, sizeof(dest_addr));
+    dest_addr.sin_family = AF_INET;
+    dest_addr.sin_port = htons(port);
+    inet_pton(AF_INET, ip, &dest_addr.sin_addr);
+
+    if (connect(socket_fd, (struct sockaddr *)&dest_addr, sizeof(dest_addr)) != 0) {
+        ESP_LOGE(TAG, "Socket connect failed");
+        close(socket_fd);
+        return -1;
+    }
+
+    ESP_LOGI(TAG, "Successfully connected to server");
+    return socket_fd;
+}
+
+
+/* Function to send a JSON message over a connected socket */
+void send_json_init_message(int socket_fd, const char *type, const char *content)
+{
+    // Create a JSON object
+    cJSON *root = cJSON_CreateObject();
+    if (root == NULL) {
+        ESP_LOGE(TAG, "Failed to create cJSON object");
+        return;
+    }
+
+    // Add data to the JSON object
+    cJSON_AddStringToObject(root, "event", type);
+    cJSON_AddStringToObject(root, "serial", content);
+
+    // Convert JSON object to string
+    char *json_string = cJSON_PrintUnformatted(root);
+    if (json_string == NULL) {
+        ESP_LOGE(TAG, "Failed to print cJSON object to string");
+        cJSON_Delete(root);
+        return;
+    }
+
+    // Send JSON string to the server
+    if (send(socket_fd, json_string, strlen(json_string), 0) < 0) {
+        ESP_LOGE(TAG, "Failed to send JSON message");
+    } else {
+        ESP_LOGI(TAG, "JSON message sent successfully: %s", json_string);
+    }
+
+    // Free JSON object and string
+    cJSON_Delete(root);
+    free(json_string);
+}
+
+void handle_on_event(const char *cluster)
+{
+    switch (atoi(cluster)) {
+        case 11111:
+            ESP_LOGI(TAG, "Received 'on' event for cluster '11111'");
+            example_ble_mesh_send_gen_onoff_set();
+            printf("sending on/off msg");
+            break;
+        case 22222:
+            ESP_LOGI(TAG, "Received 'on' event for cluster '22222'");
+            // Perform action for cluster 22222
+            break;
+        default:
+            ESP_LOGI(TAG, "Received 'on' event for unrecognized cluster '%s'", cluster);
+            break;
+    }
+}
+
+void handle_off_event(const char *cluster)
+{
+    switch (atoi(cluster)) {
+        case 11111:
+            ESP_LOGI(TAG, "Received 'off' event for cluster '11111'");
+            // Perform action for cluster 11111
+            break;
+        case 22222:
+            ESP_LOGI(TAG, "Received 'off' event for cluster '22222'");
+            // Perform action for cluster 22222
+            break;
+        default:
+            ESP_LOGI(TAG, "Received 'off' event for unrecognized cluster '%s'", cluster);
+            break;
+    }
+}
+
+void receive_json_messages(void *param)
+{
+    int socket_fd = (int) param;
+    char buffer[1024];
+    int len;
+
+    while (1) {
+        memset(buffer, 0, sizeof(buffer));
+        len = recv(socket_fd, buffer, sizeof(buffer) - 1, 0);
+
+        if (len < 0) {
+            ESP_LOGE(TAG, "Failed to receive message");
+            break;
+        } else if (len == 0) {
+            ESP_LOGI(TAG, "Connection closed by server");
+            break;
+        }
+
+        ESP_LOGI(TAG, "Received message: %s", buffer);
+
+        // Parse the JSON message
+        cJSON *json = cJSON_Parse(buffer);
+        if (json == NULL) {
+            ESP_LOGE(TAG, "Failed to parse JSON message");
+            continue;
+        }
+
+        // Handle events based on the event type
+        cJSON *event = cJSON_GetObjectItem(json, "event");
+        cJSON *cluster = cJSON_GetObjectItem(json, "cluster");
+
+        if (cJSON_IsString(event) && cJSON_IsString(cluster)) {
+            EventType event_type = get_event_type(event->valuestring);
+            switch (event_type) {
+                case EVENT_ON:
+                    handle_on_event(cluster->valuestring);
+                    break;
+                case EVENT_OFF:
+                    handle_off_event(cluster->valuestring);
+                    break;
+                default:
+                    ESP_LOGI(TAG, "Received unrecognized event: %s", event->valuestring);
+                    break;
+            }
+        } else {
+            ESP_LOGE(TAG, "Invalid JSON format or missing required fields");
+        }
+
+        cJSON_Delete(json);
+    }
+
+    // Close the socket when done
+    close(socket_fd);
+    vTaskDelete(NULL);
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+static void esp_gap_cb(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *param) {
+    switch (event) {
+        case ESP_GAP_BLE_ADV_DATA_RAW_SET_COMPLETE_EVT:
+            esp_ble_gap_start_advertising(&adv_params);
+            break;
+        default:
+            break;
+    }
+}
+
+static void mesh_event_handler(mesh_event_t event) {
+    switch (event.id) {
+        case MESH_EVENT_STARTED:
+            ESP_LOGI(TAG, "Mesh network started");
+            esp_ble_mesh_node_prov_enable(ESP_BLE_MESH_PROV_ADV | ESP_BLE_MESH_PROV_GATT);
+            break;
+        case MESH_EVENT_STOPPED:
+            ESP_LOGI(TAG, "Mesh network stopped");
+            break;
+        case MESH_EVENT_PROV_COMPLETE:
+            ESP_LOGI(TAG, "Provisioning completed");
+            break;
+        case MESH_EVENT_PROV_FAILED:
+            ESP_LOGI(TAG, "Provisioning failed");
+            break;
+        default:
+            break;
+    }
+}
+
+
+
+
+
+static void mesh_event_handler(mesh_event_t event) {
+    switch (event.id) {
+        case MESH_EVENT_STARTED:
+            ESP_LOGI(TAG, "Mesh network started");
+            esp_ble_mesh_node_prov_enable(ESP_BLE_MESH_PROV_ADV | ESP_BLE_MESH_PROV_GATT);
+            break;
+        case MESH_EVENT_STOPPED:
+            ESP_LOGI(TAG, "Mesh network stopped");
+            break;
+        case MESH_EVENT_PROV_COMPLETE:
+            ESP_LOGI(TAG, "Provisioning completed");
+            break;
+        case MESH_EVENT_PROV_FAILED:
+            ESP_LOGI(TAG, "Provisioning failed");
+            break;
+        default:
+            break;
+    }
+}
+
 void app_main(void)
 {
     esp_err_t err;
@@ -299,7 +641,7 @@ void app_main(void)
     ESP_LOGI(TAG, "Initializing...");
 
     board_init();
-
+    gpio_set_direction(PUSH_BUTTON_PIN, GPIO_MODE_INPUT);
     err = nvs_flash_init();
     if (err == ESP_ERR_NVS_NO_FREE_PAGES) {
         ESP_ERROR_CHECK(nvs_flash_erase());
@@ -326,4 +668,39 @@ void app_main(void)
     if (err) {
         ESP_LOGE(TAG, "Bluetooth mesh init failed (err %d)", err);
     }
+
+
+
+
+
+
+
+  esp_ble_adv_data_t adv_data = {
+        .set_scan_rsp = false,
+        .include_name = true,
+        .manufacturer_len = ADV_MANUFACTURER_DATA_LEN,
+        .p_manufacturer_data = NULL,
+        .service_data_len = 0,
+        .p_service_data = NULL,
+        .service_uuid_len = 0,
+        .p_service_uuid = NULL,
+        .flag = (ESP_BLE_ADV_FLAG_GEN_DISC | ESP_BLE_ADV_FLAG_BREDR_NOT_SPT),
+    };
+    
+    // Set raw advertising data
+    esp_ble_gap_config_adv_data_raw(adv_data.raw, sizeof(adv_data.raw));
+    
+    // Start advertising
+    esp_ble_gap_start_advertising(&adv_params);
+
+    // ESP_LOGI(TAG, "ESP_WIFI_MODE_STA");
+    // wifi_init_sta();
+
+    // int socket_fd = connect_to_server(REMOTE_IP_ADDR, REMOTE_PORT);
+    // if (socket_fd != -1) {
+    //     // Send a JSON message
+    //     send_json_init_message(socket_fd, "init", "213124");
+    //     // Close the socket after sending the message
+    //     xTaskCreate(&receive_json_messages, "receive_json_messages", 4096, (void*) socket_fd, 5, NULL);
+    // }
 }

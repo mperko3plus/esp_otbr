@@ -242,13 +242,15 @@ string(CONCAT OT_FULL_VERSION_STRING
        "${CONFIG_IDF_TARGET}\; ${OT_BUILD_TIMESTAMP}")
 
 idf_component_register(SRC_DIRS "${src_dirs}"
-                       EXCLUDE_SRCS "${exclude_srcs}"
-                       INCLUDE_DIRS "${public_include_dirs}"
-                       PRIV_INCLUDE_DIRS "${private_include_dirs}"
-                       REQUIRES esp_netif lwip esp_driver_uart driver
-                       LDFRAGMENTS linker.lf
-                       PRIV_REQUIRES console esp_event esp_partition esp_timer
-                                     ieee802154 mbedtls nvs_flash)
+       EXCLUDE_SRCS "${exclude_srcs}"
+       INCLUDE_DIRS "${public_include_dirs}"
+       PRIV_INCLUDE_DIRS "${private_include_dirs}"
+       REQUIRES esp_netif lwip esp_driver_uart driver
+       LDFRAGMENTS linker.lf
+       PRIV_REQUIRES console esp_event esp_partition esp_timer
+                     ieee802154 mbedtls nvs_flash json)
+
+
 
 if(CONFIG_OPENTHREAD_ENABLED OR CONFIG_OPENTHREAD_SPINEL_ONLY)
     if(CONFIG_OPENTHREAD_RADIO)

@@ -19,7 +19,9 @@
 
 #define BUTTON_IO_NUM           0
 #define BUTTON_ACTIVE_LEVEL     0
-
+#define LED_R GPIO_NUM_3
+#define LED_G GPIO_NUM_3
+#define LED_B GPIO_NUM_3
 
 
 struct _led_state led_state[3] = {

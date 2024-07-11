@@ -37,7 +37,8 @@
 #define PROFILE_NUM      1
 #define PROFILE_A_APP_ID 0
 #define INVALID_HANDLE   0
-
+#define PROFILE_NUM                1
+#define PROFILE_A_APP_ID           0
 static const char remote_device_name[] = "ESP_GATTS_DEMO";
 static bool connect    = false;
 static bool get_server = false;
